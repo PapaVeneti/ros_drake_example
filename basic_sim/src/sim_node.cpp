@@ -8,6 +8,7 @@
 
 #include "ros/ros.h"
 #include "std_msgs/String.h"
+#include "std_msgs/Float64.h"
 #include "rosgraph_msgs/Clock.h"
 #include "sensor_msgs/JointState.h"
 
@@ -17,23 +18,60 @@
 #include <cmath>
 
 
-drake::systems::EventStatus publishClock(const ros::Publisher & pub, const drake::systems::Context<double> & context ){
-    
-    double time =  context.get_time();
+/** This monitor function publishes the simulation clock in the `/clock` topic. So every 
+node subscribes to this topic to synchronize with the simulation clock when using
+the `ros::Time` API. 
+*/
+drake::systems::EventStatus publishClock(const ros::Publisher & pub, const drake::systems::Context<double> & context ){    
     
     rosgraph_msgs::Clock clock_msg;
-    clock_msg.clock = ros::Time(time);
+    clock_msg.clock = ros::Time(context.get_time());
     pub.publish(clock_msg);
 
     return drake::systems::EventStatus::Succeeded();
 }
 
+/**
 
-// Subscriber
-void chatterCallback(const std_msgs::String::ConstPtr& msg){
-  ROS_INFO("I heard: [%s]", msg->data.c_str());
-  drake::log()->info("I heard: {}", msg->data.c_str()) ; 
-}
+TO DO : 
+1. change xd to be an eigen vector containing the whole state
+*/
+class simInterface{
+public:
+  simInterface(const sensor_msgs::JointState & InitialJointState): n() {
+
+    controllerSub  = n.subscribe("/joint1_position_controller", 1000, &simInterface::controllerCallback,this);
+    encoderPub     = n.advertise<sensor_msgs::JointState>("/joint_states",10);
+
+    joint_state = InitialJointState; //gets joint names
+    xd = InitialJointState.position[0];
+  }
+
+  inline double get_command(void){return xd;}
+
+  void encoderPublish(const sensor_msgs::JointState & CurrentJointState){
+    joint_state = CurrentJointState;
+    encoderPub.publish(joint_state);
+
+  } 
+
+private:
+
+  void controllerCallback(const std_msgs::Float64::ConstPtr& command){
+    ROS_INFO("[simController]: New command: %.3lf", command->data);
+    xd = command->data; 
+  }
+
+  std_msgs::Float64 command;
+  sensor_msgs::JointState joint_state;
+  double xd;
+
+  ros::NodeHandle n;
+  ros::Subscriber controllerSub;
+  ros::Publisher encoderPub;
+
+};
+
 
 
 int main(int argc, char **argv){
@@ -41,22 +79,12 @@ int main(int argc, char **argv){
 // Node Set up 
 ros::init(argc, argv, "Simulator");
 ros::NodeHandle n;
-
-double loop_freq = 10;
-ros::Rate loop_rate(loop_freq); //HZ
-
-ros::Subscriber controllerSub  = n.subscribe("chatter", 1000, chatterCallback);
-ros::Publisher  encoderPub     = n.advertise<sensor_msgs::JointState>("/joint_states",10);
 ros::Publisher clock_publisher = n.advertise<rosgraph_msgs::Clock>("/clock",10);
 
-// Add a "false" delay
+double loop_freq = 100;
+ros::Rate loop_rate(loop_freq); //HZ
 
-// encoderPub.getTopic();
-// while( encoderPub.getNumSubscribers()==0){
-//   loop_rate.sleep();
-// }
-
-// simulation set up
+// system  set up
 #pragma region
 
 drake::systems::DiagramBuilder<double> builder;
@@ -76,106 +104,82 @@ builder.Connect(controller->get_output_port_control(),pendulum->get_input_port()
 builder.ExportInput(controller->get_input_port_desired_state());
 builder.ExportOutput(pendulum->get_state_output_port());
 
-drake::systems::VectorLogSink<double>* logger=
-drake::systems::LogVectorOutput(pendulum->get_output_port(),&builder);
-
-logger->set_name("Logger");
-
 auto diagram = builder.Build();
 diagram -> set_name("Diagram");
 
-drake::systems::Simulator simulator(*diagram);
-auto& context = simulator.get_mutable_context();
-auto& pendulum_context = diagram->GetMutableSubsystemContext(*pendulum, &context);
+// END BUILDING DIAGRAM OF SIMULATED SYSTEM
+#pragma endregion
 
+// simulation  set up
+#pragma region
+drake::systems::Simulator simulator(*diagram);
 
 //Set monitoring function
 auto bindedClockFun = std::bind(publishClock,clock_publisher,std::placeholders::_1);
-
 // Create a function object
 std::function<drake::systems::EventStatus(const drake::systems::Context<double> & )> monitor_func = bindedClockFun;
-
 // Pass the monitor function to the simulator
 simulator.set_monitor(monitor_func);
 
-//simulator option
-simulator.set_target_realtime_rate(0.1);
-simulator.get_mutable_integrator().set_maximum_step_size(0.0001);
+//simulator options
+simulator.set_target_realtime_rate(1.2); // a little lower due to publishing
+simulator.get_mutable_integrator().set_maximum_step_size(0.001);
+
 
 #pragma endregion
 
 
 // State and control
 Eigen::Vector2d x0(0,0) ;
-Eigen::Vector2d xd(M_PI_2,0.);
+Eigen::Vector2d xd(0,0.);
 
+auto& context = simulator.get_mutable_context();
+auto& pendulum_context = diagram->GetMutableSubsystemContext(*pendulum, &context);
+
+// Initial condition
 pendulum_context.get_mutable_continuous_state_vector().SetFromVector(x0);
-diagram->get_input_port(0).FixValue(&context,xd); // this must be changed
+// Default goal
+diagram->get_input_port(0).FixValue(&context,x0); // this must be changed
 
-
-// Encoder Publishing
 sensor_msgs::JointState JointState;
+//from parameter server
 JointState.name.push_back("joint1");
-JointState.position.push_back(x0(0)); 
-JointState.velocity.push_back(x0(1)); 
-JointState.header.stamp = ros::Time(0); 
-
-encoderPub.publish(JointState);
-
-// helper vars
-double tf,x1f,x2f;
-int nSteps;
-double time = 0;
+JointState.position.push_back(x0(0));
+JointState.velocity.push_back(x0(1));
+JointState.header.stamp = ros::Time(0);
 
 
-//1.  Change the logger. Get info from context immidiately
+simInterface simInterface(JointState);
+
+
+
+
 //2.  Get controller data
 //3.  First Publish then simulate 
 
+double time = 0;
 while (ros::ok())
 {
+  auto& sim_context = simulator.get_mutable_context();
+
+  //upate cmd:
+  xd(0)=simInterface.get_command();
+  diagram->get_input_port(0).FixValue(&sim_context,xd); // this must be changed
+
+  //publish encoders:
+  JointState.position[0] = sim_context.get_continuous_state_vector()[0];
+  JointState.velocity[0] = sim_context.get_continuous_state_vector()[1];
+  JointState.header.stamp = ros::Time( sim_context.get_time());
+  simInterface.encoderPublish(JointState);
+
+  //simulate
   time +=  1./loop_freq; 
   simulator.AdvanceTo(time);
 
-  auto& log = logger -> FindLog(simulator.get_context()) ;   
-  nSteps = simulator.get_num_steps_taken();
+  ros::spinOnce();
+  if (!loop_rate.sleep()){ROS_WARN("slept too much");} //returns false
 
-  JointState.position[0] = log.data()(0,nSteps);
-  JointState.velocity[0] = log.data()(1,nSteps);
-  JointState.header.stamp = ros::Time(log.sample_times()[nSteps]); 
-  encoderPub.publish(JointState);
-
-  ros::spinOnce(); // get data from controller
-  loop_rate.sleep(); //returns false
-
-  // Write sim data to file (deprecated)
-  #pragma region 
-
-  // std::string dataFile = "data.csv";
-
-  // // Create an output file stream
-  // std::ofstream outData(dataFile);
-
-  // // Check if the file stream is open
-  // if (outData.is_open()) {
-
-  //     // Concacate the matrices
-  //     Eigen::MatrixX3d DATA(log.sample_times().size(),3); 
-  //     DATA << log.sample_times() , log.data().transpose();
-
-  //     outData << DATA; 
-      
-  //     // Close the file stream
-  //     outData.close();
-
-  //     std::cout << "String successfully written to file: " << dataFile << std::endl;
-  // } else {
-  //     std::cerr << "Error opening the file: " << dataFile << std::endl;
-  // }
-
-  #pragma endregion
 
 }
-
   return 0;
 }

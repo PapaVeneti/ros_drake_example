@@ -1,2 +1,5 @@
 basic_sim/build/
 hello_world/build/
+basic_sim/src/sim_node_class.cpp
+build/
+launch/
