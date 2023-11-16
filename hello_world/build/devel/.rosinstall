@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /home/papaveneti/rosDrake/src/hello_world/build/devel/setup.sh

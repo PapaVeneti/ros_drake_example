@@ -1,0 +1,2 @@
+- setup-file:
+    local-name: /home/papaveneti/rosDrake/src/basic_sim/build/devel/setup.sh

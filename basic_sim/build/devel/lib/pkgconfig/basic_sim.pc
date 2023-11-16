@@ -1,0 +1,8 @@
+prefix=/home/papaveneti/rosDrake/src/basic_sim/build/devel
+
+Name: basic_sim
+Description: Description of basic_sim
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 
